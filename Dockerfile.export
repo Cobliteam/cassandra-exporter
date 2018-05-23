@@ -6,6 +6,4 @@ RUN npm install
 ADD index.js index.js
 ADD export.js export.js
 
-VOLUME /data
-
 ENTRYPOINT node export.js

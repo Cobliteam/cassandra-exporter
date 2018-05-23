@@ -1,0 +1,11 @@
+version: '3.6'
+
+services:
+  cassandra-export:
+    build:
+      context: .
+      dockerfile: Dockerfile.export
+    env_file:
+      - environment.env
+    volumes:
+      - ./data:/data
