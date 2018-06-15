@@ -1,7 +1,9 @@
-var Promise = require('bluebird');
-var cassandra = require('cassandra-driver');
-var fs = require('fs');
-var jsonStream = require('JSONStream');
+const Promise = require('bluebird');
+const cassandra = require('cassandra-driver');
+const fs = require('fs');
+const jsonStream = require('JSONStream');
+
+const {runCqlsh, getCqlVersion} = require('./cqlsh');
 
 var HOST = process.env.HOST || '127.0.0.1';
 var PORT = process.env.PORT || 9042;
@@ -15,8 +17,9 @@ if (!KEYSPACE) {
 var USER = process.env.USER;
 var PASSWORD = process.env.PASSWORD;
 var DIRECTORY = process.env.DIRECTORY || "./data";
-var authProvider;
+var cqlshOptions = {user: USER, password: PASSWORD, host: HOST, port: PORT};
 
+var authProvider;
 if (USER && PASSWORD) {
     authProvider = new cassandra.auth.PlainTextAuthProvider(USER, PASSWORD);
 }
@@ -24,10 +27,98 @@ if (USER && PASSWORD) {
 var systemClient = new cassandra.Client({contactPoints: [HOST], authProvider: authProvider, protocolOptions: {port: [PORT]}});
 var client = new cassandra.Client({ contactPoints: [HOST], keyspace: KEYSPACE, authProvider: authProvider, protocolOptions: {port: [PORT]}});
 
+function getSchemaTypeNames(keyspace) {
+    return systemClient.execute('SELECT type_name FROM system_schema.types WHERE keyspace_name = ?',
+                                [keyspace])
+        .then(result => Array.from(result.rows, row => row.type_name));
+}
+
+function getSchemaTypeQueries(keyspace, typeNames) {
+    return typeNames.map(typeName => `DESCRIBE TYPE "${keyspace}"."${typeName}"`);
+}
+
+function getSchemaTypeDefinitions(cqlVersion, keyspace) {
+    return getSchemaTypeNames(keyspace)
+        .then(typeNames => {
+            if (typeNames.length > 0) {
+                var query = getSchemaTypeQueries(keyspace, typeNames).join('; ') + ';';
+                return runCqlsh(cqlVersion, query, cqlshOptions);
+            } else {
+                return null;
+            }
+        });
+}
+
+function getSchemaFunctionNames(keyspace) {
+    return systemClient.execute('SELECT function_name FROM system_schema.functions WHERE keyspace_name = ?',
+                                [keyspace])
+        .then(result => Array.from(result.rows, row => row.function_name));
+}
+
+function getSchemaFunctionQueries(keyspace, functionNames) {
+    return functionNames.map(functionName => `DESCRIBE FUNCTION "${keyspace}"."${functionName}"`);
+}
+
+function getSchemaFunctionDefinitions(cqlVersion, keyspace) {
+    return getSchemaFunctionNames(keyspace)
+        .then(functionNames => {
+            if (functionNames.length > 0) {
+                var query = getSchemaFunctionQueries(keyspace, functionNames).join('; ') + ';';
+                return runCqlsh(cqlVersion, query, cqlshOptions);
+            } else {
+                return null;
+            }
+        });
+}
+
+function processSharedSchemaExport(keyspace, path) {
+    return getCqlVersion(systemClient)
+        .then(cqlVersion => Promise.all([getSchemaTypeDefinitions(cqlVersion, keyspace),
+                                         getSchemaFunctionDefinitions(cqlVersion, keyspace)]))
+        .then(([typeSchema, functionSchema]) => {
+            if (!typeSchema && !functionSchema)
+                return null;
+
+            console.log("Exporting keyspace TYPEs and FUNCTIONs to shared schema")
+
+            var schemaFile = fs.createWriteStream(path);
+            new Promise((resolve, reject) => {
+                schemaFile.on('error', reject);
+                schemaFile.on('finish', () => resolve());
+                if (typeSchema) {
+                    schemaFile.write(typeSchema.replace(new RegExp('CREATE TYPE', 'g'),
+                                                        'CREATE TYPE IF NOT EXISTS'));
+                    schemaFile.write('\n');
+                }
+                if (functionSchema) {
+                    schemaFile.write(functionSchema.replace(new RegExp('CREATE FUNCTION', 'g'),
+                                                            'CREATE FUNCTION IF NOT EXISTS'));
+                    schemaFile.write('\n');
+                }
+                schemaFile.end();
+            });
+        });
+}
+
+function processTableSchema(table, path) {
+    return getCqlVersion(systemClient)
+        .then(cqlVersion => runCqlsh(cqlVersion, `DESCRIBE TABLE "${KEYSPACE}"."${table}"`))
+        .then(schemaData => {
+            var schemaFile = fs.createWriteStream(path);
+            return new Promise((resolve, reject) => {
+                schemaFile.on('error', reject);
+                schemaFile.on('finish', () => resolve());
+                schemaFile.write(schemaData);
+                schemaFile.end();
+            });
+        });
+}
+
 function processTableExport(table) {
     console.log('==================================================');
     console.log('Reading table: ' + table);
-    return new Promise(function(resolve, reject) {
+
+    return processTableSchema(table, DIRECTORY + "/" + table + ".cql").then(() => new Promise((resolve, reject) => {
         var jsonfile = fs.createWriteStream(DIRECTORY +"/" + table + '.json');
         jsonfile.on('error', function (err) {
             reject(err);
@@ -90,43 +181,35 @@ function processTableExport(table) {
             console.log('Finalizing writes into: ' + table + '.json');
             writeStream.end();
         });
-    });
+    }));
+}
+
+function getTables() {
+    if (process.env.TABLE)
+        return Promise.resolve(process.env.TABLE.split(','));
+
+    var systemQuery = "SELECT columnfamily_name AS table_name FROM system.schema_columnfamilies WHERE keyspace_name = ?";
+    if (systemClient.metadata.keyspaces.system_schema) {
+        systemQuery = "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?";
+    }
+
+    console.log('Finding tables in keyspace: ' + KEYSPACE);
+    return systemClient.execute(systemQuery, [KEYSPACE]).
+        then(result => Array.from(result.rows, row => row.table_name));
 }
 
 systemClient.connect()
-    .then(function (){
-        var systemQuery = "SELECT columnfamily_name as table_name FROM system.schema_columnfamilies WHERE keyspace_name = ?";
-        if (systemClient.metadata.keyspaces.system_schema) {
-            systemQuery = "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?";
-        }
-
-        console.log('Finding tables in keyspace: ' + KEYSPACE);
-        return systemClient.execute(systemQuery, [KEYSPACE]);
-    })
-    .then(function (result){
-        var tables = [];
-        for(var i = 0; i < result.rows.length; i++) {
-            tables.push(result.rows[i].table_name);
-        }
-
-        if (process.env.TABLE) {
-            var tables = process.env.TABLE.split(',');
-            return Promise.each(tables, function(table){
-                return processTableExport(table);
-            });
-        }
-
-        return Promise.each(tables, function(table){
-            return processTableExport(table);
-        });
-    })
-    .then(function (){
+    .then(() => processSharedSchemaExport(KEYSPACE, DIRECTORY + "/_shared.cql"))
+    .then(() => getTables())
+    .then(tables => Promise.each(tables, processTableExport))
+    .then(() => {
         console.log('==================================================');
         console.log('Completed exporting all tables from keyspace: ' + KEYSPACE);
         var gracefulShutdown = [];
         gracefulShutdown.push(systemClient.shutdown());
         gracefulShutdown.push(client.shutdown());
-        Promise.all(gracefulShutdown)
+
+        return Promise.all(gracefulShutdown)
             .then(function (){
                 process.exit();
             })
