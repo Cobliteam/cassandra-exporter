@@ -155,7 +155,7 @@ systemClient.connect()
         if (process.env.TABLE) {
             var tables = process.env.TABLE.split(',');
             return Promise.each(tables, function(table){
-                return processTableExport(table);
+                return processTableImport(table);
             });
         }
 
